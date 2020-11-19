@@ -1,0 +1,2 @@
+org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
+  wilbur.demo.spring.boot.autoconfigure.properties.StudentAutoConfiguration
