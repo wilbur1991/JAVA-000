@@ -15,9 +15,13 @@ c 自动装配 ComponentDemo
 
 ### 4（必做）给前面课程提供的Student/Klass/School 实现自动配置和Starter。
 
-自动配置详见springbootDemo项目的wilbur.demo.springboot.beans
+a 自动配置详见springbootDemo项目的wilbur.demo.springboot.beans
 
-Starter ：待完成  
+b 实现Starter，详见demo-starter项目，通过该作业熟悉了创建spring-boot-starter的流程及规范。
+  demo-spring-boot-autoconfigue模块包括StudentProperties(设置student相关属性)，StudentAutoConfiguration（自动配置，使用@ConditionOnClass和@ConditionalOnMissingBean）；
+  demo-spring-boot-starter模块依赖autoconfigure模块，无实质代码或配置；
+  demo-spring-boot-samples模块为starter使用示例，直接引用demo-spring-boot-starter模块。
+
 
 ### 6（必做）研究一下JDBC 接口和数据库连接池，掌握它们的设计和用法：
 
