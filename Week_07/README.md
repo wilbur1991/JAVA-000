@@ -247,6 +247,362 @@ total insert time in 8290 ms
 
 
 ## 2.（必做）**读写分离 - 动态切换数据源版本 1.0
+
+添加多数据源配置,一个支持读写的数据源writeDS，两个只读数据源readA，readB。基于DynamicDataSourceConfig构建JdbcTemplate。
+
+``` java
+
+@Configuration
+public class DataSourceConfig {
+    @Bean(name = DataSourceConstant.DEFAULT_DATASOURCE)
+    @ConfigurationProperties("spring.datasource.write")
+    public DataSource writeDataSource() {
+        return DataSourceBuilder.create().type(HikariDataSource.class).build();
+    }
+
+    @Bean(name = "readA")
+    @ConfigurationProperties("spring.datasource.read1")
+    public DataSource readADataSource() {
+        return DataSourceBuilder.create().type(HikariDataSource.class).build();
+    }
+
+    @Bean(name = "readB")
+    @ConfigurationProperties("spring.datasource.read2")
+    public DataSource readBDataSource() {
+        return DataSourceBuilder.create().type(HikariDataSource.class).build();
+    }
+
+    @Bean
+    public DynamicDataSourceConfig getRoutingDataSourceConfig() {
+        Map<Object, Object> targetDataSources = new HashMap<>(2);
+        targetDataSources.put("readA", readADataSource());
+        targetDataSources.put("readB", readBDataSource());
+        return new DynamicDataSourceConfig(writeDataSource(), targetDataSources);
+    }
+
+    @Bean("jdbcTemplate")
+    public JdbcTemplate jdbcTemplate() {
+        return new JdbcTemplate(getRoutingDataSourceConfig());
+    }
+
+}
+
+```
+
+继承AbstractRoutingDataSource，通过threadLocalDataSourceKey保存当前线程中使用的dataSource名称，通过重写determineCurrentLookupKey 实现动态数据源切换。
+
+```java
+
+public class DynamicDataSourceConfig extends AbstractRoutingDataSource {
+    private static final ThreadLocal<String> threadLocalDataSourceKey = new ThreadLocal<>();
+
+    public DynamicDataSourceConfig(DataSource defaultTargetDataSource, Map<Object, Object> targetDataSources) {
+        super.setDefaultTargetDataSource(defaultTargetDataSource);
+        super.setTargetDataSources(targetDataSources);
+        super.afterPropertiesSet();
+    }
+
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return getDataSource();
+    }
+
+    public static void setDataSource(String dataSource) {
+        threadLocalDataSourceKey.set(dataSource);
+    }
+
+    public static String getDataSource() {
+        return threadLocalDataSourceKey.get();
+    }
+
+    public static void clearDataSource() {
+        threadLocalDataSourceKey.remove();
+    }
+
+}
+
+```
+
+自定义注解DynamicDataSource,使用时如果想使用从库，需显示指定readOnly为true。
+
+```java
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface DynamicDataSource {
+    boolean readOnly() default false;
+}
+
+```
+
+使用AOP对使用了DynamicDataSource的dao层切换只读数据源。通过loadBalance方法随机获取只读数据源，需注意在切换数据源后需手动恢复到默认数据源。
+
+```java
+import static wilbur.demo.springboot.constant.DataSourceConstant.DEFAULT_DATASOURCE;
+
+@Aspect
+@Component
+public class DynamicDataSourceAspect {
+
+    @Autowired
+    private DynamicDataSourceConfig dynamicDataSourceConfig;
+
+    @Pointcut("@annotation(wilbur.demo.springboot.annotation.DynamicDataSource)")
+    public void routingWith() {
+    }
+
+    @Around("routingWith() && @annotation(dynamicDataSource)")
+    public Object routingWithDataSource(ProceedingJoinPoint joinPoint, DynamicDataSource dynamicDataSource) throws Throwable {
+        if (dynamicDataSource.readOnly()) {
+            final String slave = loadBalance();
+            System.out.println("use readonly datasource " + slave);
+            DynamicDataSourceConfig.setDataSource(slave);
+        } else {
+            System.out.println("use readonly datasource " + DEFAULT_DATASOURCE);
+            DynamicDataSourceConfig.setDataSource(DEFAULT_DATASOURCE);
+        }
+        Object result = joinPoint.proceed();
+        //执行结束后恢复默认数据源
+        DynamicDataSourceConfig.setDataSource(DEFAULT_DATASOURCE);
+        return result;
+    }
+
+		//随机获取只读数据源
+    private String loadBalance() {
+        Map<Object, DataSource> dataSourceMap = dynamicDataSourceConfig.getResolvedDataSources();
+        List<Object> keys = new ArrayList<>(dataSourceMap.keySet()).stream().collect(Collectors.toList());
+        final int i = ThreadLocalRandom.current().nextInt(keys.size());
+        return keys.get(i).toString();
+    }
+
+}
+
+```
+
+OrderItemDao定义如下,使用JdbcTemplate实现简单数据库插入、读取操作。
+
+```java
+
+@Repository
+public class OrderItemDao {
+    static final String SQL = "INSERT INTO `order_item`( `order_id`, `commodity_id`, `num`, `origin_price`, `actual_price`) VALUES ";
+    static final String VALUE_FORMAT = "( %d, %d, %d, %f, %f)";
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    public void insert(OrderItem orderItem) {
+        float price = ThreadLocalRandom.current().nextInt(100) + ThreadLocalRandom.current().nextFloat();
+        String sql = SQL + String.format(VALUE_FORMAT, ThreadLocalRandom.current().nextInt(10000), ThreadLocalRandom.current().nextInt(10000), 1, price, price * 0.8);
+        jdbcTemplate.execute(sql);
+    }
+
+    @DynamicDataSource(readOnly = true)
+    public List<Map<String, Object>> select() {
+        String sql = "select * from order_item order by id desc limit 10";
+        return jdbcTemplate.queryForList(sql);
+    }
+}
+
+```
+
+service层定义如下：
+
+```java
+
+@Service
+public class OrderService {
+    @Autowired
+    private OrderItemDao orderItemDao;
+
+    public void insert(OrderItem orderItem) {
+        orderItemDao.insert(orderItem);
+    }
+
+    public List<Map<String, Object>> list() {
+        return orderItemDao.select();
+    }
+}
+
+```
+
+创建测试类，模拟查询、插入、再查询的操作流程,执行结果符合预期。
+
+```java
+
+@SpringBootTest
+class SpringbootApplicationTests {
+
+    @Autowired
+    private OrderService orderService;
+
+    @Test
+    void testDataSourceChange() {
+        List<Map<String, Object>> result = orderService.list();
+        System.out.println(result.toString());
+        orderService.insert(new OrderItem());
+        result = orderService.list();
+        System.out.println(result.toString());
+        result = orderService.list();
+        System.out.println(result.toString());
+    }
+}
+
+```
+
+
+
 ## 3.（必做）**读写分离 - 数据库框架版本 2.0
 
-最近加班太多，2，3后续补充。
+使用sharding-jdbc + mybatis实现读写分离。
+
+sharding-jdbc配置如下：
+
+```properties
+sharding.jdbc.datasource.names=primary-ds,replica-ds-0,replica-ds-1
+
+sharding.jdbc.datasource.primary-ds.jdbc-url=jdbc:mysql://localhost:3306/job?serverTimezone=UTC&useSSL=false&useUnicode=true&characterEncoding=UTF-8
+sharding.jdbc.datasource.primary-ds.type=com.zaxxer.hikari.HikariDataSource
+sharding.jdbc.datasource.primary-ds.driver-class-name=com.mysql.jdbc.Driver
+sharding.jdbc.datasource.primary-ds.username=one_dev
+sharding.jdbc.datasource.primary-ds.password=one_dev
+
+sharding.jdbc.datasource.replica-ds-0.jdbc-url=jdbc:mysql://localhost:3306/java_camp_demo_a?serverTimezone=UTC&useSSL=false&useUnicode=true&characterEncoding=UTF-8
+sharding.jdbc.datasource.replica-ds-0.type=com.zaxxer.hikari.HikariDataSource
+sharding.jdbc.datasource.replica-ds-0.driver-class-name=com.mysql.jdbc.Driver
+sharding.jdbc.datasource.replica-ds-0.username=one_dev
+sharding.jdbc.datasource.replica-ds-0.password=one_dev
+
+sharding.jdbc.datasource.replica-ds-1.jdbc-url=jdbc:mysql://localhost:3306/java_camp_demo_b?serverTimezone=UTC&useSSL=false&useUnicode=true&characterEncoding=UTF-8
+sharding.jdbc.datasource.replica-ds-1.type=com.zaxxer.hikari.HikariDataSource
+sharding.jdbc.datasource.replica-ds-1.driver-class-name=com.mysql.jdbc.Driver
+sharding.jdbc.datasource.replica-ds-1.username=one_dev
+sharding.jdbc.datasource.replica-ds-1.password=one_dev
+
+
+sharding.jdbc.config.masterslave.load-balance-algorithm-type=round_robin
+sharding.jdbc.config.masterslave.master-data-source-name=primary-ds
+sharding.jdbc.config.masterslave.slave-data-source-names=replica-ds-0,replica-ds-1
+sharding.jdbc.config.masterslave.name=ms
+sharding.jdbc.config.props.sql.show=true
+
+
+```
+
+service实现如下：
+
+```java
+
+@Service
+public class OrderItemServiceImpl implements OrderItemService {
+    @Resource
+    private OrderItemMapper orderItemMapper;
+
+    @Override
+    public List<OrderItem> selectTopTen() {
+        return orderItemMapper.selectTopTen();
+    }
+
+    @Override
+    @Transactional
+    public List<OrderItem> selectInTransaction() {
+        return orderItemMapper.selectTopTen();
+    }
+  
+    @Override
+    public List<OrderItem> insertAndSelect() {
+
+        orderItemMapper.insert(generateOrderItem());
+        return orderItemMapper.selectTopTen();
+    }
+
+    @Override
+    @Transactional
+    public List<OrderItem> insertAndSelectInTransaction() {
+        orderItemMapper.insert(generateOrderItem());
+        return orderItemMapper.selectTopTen();
+    }
+
+    private OrderItem generateOrderItem(){
+        OrderItem orderItem = new OrderItem();
+        double price = ThreadLocalRandom.current().nextInt(100) + ThreadLocalRandom.current().nextDouble();
+        orderItem.setOrderId(ThreadLocalRandom.current().nextLong(10000));
+        orderItem.setCommodityId(ThreadLocalRandom.current().nextLong(10000));
+        orderItem.setNum(1);
+        orderItem.setOriginPrice(price);
+        orderItem.setOriginPrice(price*0.8);
+        return orderItem;
+    }
+
+
+}
+
+```
+
+添加测试类，分别测试只读，事务内只读，写之后读，事务内写后读使用数据源的情况：
+
+```java
+
+@SpringBootTest
+class ShardingSphereDemoApplicationTests {
+
+	@Autowired
+	private OrderItemService orderItemService;
+	@Test
+	void testReadOnly() {
+		System.out.println(orderItemService.selectTopTen().toString());
+	}
+  @Test
+	void testSelectInTransaction() {
+		System.out.println(orderItemService.selectInTransaction().toString());
+	}
+  
+	@Test
+	void testWriteAndRead() {
+		System.out.println(orderItemService.insertAndSelect().toString());
+	}
+
+	@Test
+	void testWriteAndReadInTransaction() {
+		System.out.println(orderItemService.insertAndSelectInTransaction().toString());
+	}
+}
+
+```
+
+只读结果如下，可看到使用了从库数据源replica-ds-0：
+
+```
+2020-12-13 11:33:10.672  INFO 32266 --- [           main] ShardingSphere-SQL                       : Rule Type: master-slave
+2020-12-13 11:33:10.672  INFO 32266 --- [           main] ShardingSphere-SQL                       : SQL: select * from order_item order by id desc limit 10 ::: DataSources: replica-ds-0
+
+```
+
+事务内只读，可看到使用从库数据源replica-ds-0：
+
+```
+2020-12-13 11:37:03.029  INFO 32438 --- [           main] ShardingSphere-SQL                       : Rule Type: master-slave
+2020-12-13 11:37:03.029  INFO 32438 --- [           main] ShardingSphere-SQL                       : SQL: select * from order_item order by id desc limit 10 ::: DataSources: replica-ds-0
+
+```
+
+写之后读，可看到写入时使用主库 primary-ds，查询时使用从库replica-ds-0：
+
+```
+2020-12-13 11:35:18.960  INFO 32345 --- [           main] ShardingSphere-SQL                       : Rule Type: master-slave
+2020-12-13 11:35:18.960  INFO 32345 --- [           main] ShardingSphere-SQL                       : SQL: INSERT INTO `order_item`( `order_id`, `commodity_id`, `num`, `origin_price`, `actual_price`)  VALUES (?,?,?,?,?) ::: DataSources: primary-ds
+2020-12-13 11:35:18.995  INFO 32345 --- [           main] ShardingSphere-SQL                       : Rule Type: master-slave
+2020-12-13 11:35:18.995  INFO 32345 --- [           main] ShardingSphere-SQL                       : SQL: select * from order_item order by id desc limit 10 ::: DataSources: replica-ds-0
+
+```
+
+事务内写后读，写之后读，可看到写入时使用主库 primary-ds，写入后的查询时使用从库replica-ds-0，解决了写完读不一致的问题：
+
+```
+2020-12-13 11:27:28.991  INFO 32116 --- [           main] ShardingSphere-SQL                       : Rule Type: master-slave
+2020-12-13 11:27:28.991  INFO 32116 --- [           main] ShardingSphere-SQL                       : SQL: INSERT INTO `order_item`( `order_id`, `commodity_id`, `num`, `origin_price`, `actual_price`)  VALUES (?,?,?,?,?) ::: DataSources: primary-ds
+2020-12-13 11:27:29.019  INFO 32116 --- [           main] ShardingSphere-SQL                       : Rule Type: master-slave
+2020-12-13 11:27:29.020  INFO 32116 --- [           main] ShardingSphere-SQL                       : SQL: select * from order_item order by id desc limit 10 ::: DataSources: primary-ds
+
+```
+
