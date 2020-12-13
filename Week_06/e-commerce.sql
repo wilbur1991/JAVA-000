@@ -20,9 +20,10 @@ CREATE TABLE IF NOT EXISTS `commodity` (
 -- ----------------------------
 -- Table structure for order
 -- ----------------------------
-CREATE TABLE IF NOT EXISTS `order` (
+CREATE TABLE IF NOT EXISTS `t_order` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT '主键ID',
   `user_id` bigint(20) DEFAULT NULL COMMENT '用户ID',
+  `order_id` bigint(20) DEFAULT NULL COMMENT '用户ID',
   `total_amount` decimal(10,0) DEFAULT NULL COMMENT '总金额',
   `actual_amount` decimal(10,0) DEFAULT NULL COMMENT '实付金额',
   `date_created` datetime DEFAULT NULL COMMENT '创建时间',
@@ -35,9 +36,10 @@ CREATE TABLE IF NOT EXISTS `order` (
 -- ----------------------------
 -- Table structure for order_item
 -- ----------------------------
-CREATE TABLE IF NOT EXISTS `order_item` (
+CREATE TABLE IF NOT EXISTS `t_order_item` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT '主键ID',
   `order_id` bigint(20) unsigned DEFAULT NULL COMMENT '订单ID',
+  `user_id` bigint(20) DEFAULT NULL COMMENT '用户ID',
   `commodity_id` bigint(20) unsigned DEFAULT NULL COMMENT '商品ID',
   `num` int(10) DEFAULT NULL COMMENT '购买商品数量',
   `origin_price` decimal(10,2) DEFAULT NULL COMMENT '商品原价',
